@@ -1,0 +1,19 @@
+{
+  "name": "boogle-pipeline",
+  "version": "0.5.0",
+  "description": "Boogle AI Content Pipeline by Content Psycho — Stage 5 Unified",
+  "main": "generate.js",
+  "scripts": {
+    "generate": "node generate.js",
+    "captions": "node caption_burn.js",
+    "worker": "node worker/index.js",
+    "test:run": "node generate.js \"Why most creators fail in the first 90 days\""
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.27.0",
+    "@supabase/supabase-js": "^2.106.1",
+    "dotenv": "^16.4.5",
+    "ffmpeg-static": "^5.2.0",
+    "fluent-ffmpeg": "^2.1.3"
+  }
+}

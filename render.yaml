@@ -1,0 +1,82 @@
+# ═══════════════════════════════════════════════════════════════
+#  Render Blueprint — one-click Boogle Runner (Stage 11 Phase 3)
+#
+#  Deploys the runner as a background worker (no inbound HTTP — it
+#  polls the dashboard). Render builds the repo's Dockerfile.
+#
+#  One-click: https://render.com/deploy?repo=<your-runner-repo-url>
+#  Render reads this file, then prompts for every `sync: false` var.
+#  Paste your runner token + dashboard URL + BYOK keys at that step.
+# ═══════════════════════════════════════════════════════════════
+services:
+  - type: worker
+    name: boogle-runner
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    region: singapore
+    autoDeploy: true
+    envVars:
+      # ── Connection ──
+      - key: BOOGLE_DASHBOARD_URL
+        sync: false
+      - key: BOOGLE_RUNNER_TOKEN
+        sync: false
+      - key: BOOGLE_INTERNAL_TOKEN
+        sync: false
+      - key: BOOGLE_USER_ID
+        sync: false
+      # ── AI services (BYOK) ──
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ELEVENLABS_VOICE_ID
+        sync: false
+      - key: HEYGEN_API_KEY
+        sync: false
+      - key: HEYGEN_AVATAR_ID
+        sync: false
+      - key: HEYGEN_VOICE_ID
+        sync: false
+      - key: ASSEMBLYAI_API_KEY
+        sync: false
+      - key: APIFY_API_KEY
+        sync: false
+      # ── Posting ──
+      - key: AYRSHARE_API_KEY
+        sync: false
+      - key: POSTING_PLATFORMS
+        sync: false
+      - key: POST_APPROVAL
+        value: "true"
+      - key: POST_IMMEDIATELY
+        value: "false"
+      - key: POST_TIMEZONE
+        sync: false
+      # ── Brand / content config ──
+      - key: NICHE
+        sync: false
+      - key: PRIMARY_AUDIENCE
+        sync: false
+      - key: TARGET_COUNTRY
+        sync: false
+      - key: TARGET_LANGUAGE
+        sync: false
+      - key: TONE
+        sync: false
+      - key: CAPTION_STYLE
+        sync: false
+      # ── Trend scraping ──
+      - key: MONITOR_TIKTOK_HASHTAGS
+        sync: false
+      - key: MONITOR_INSTAGRAM_HASHTAGS
+        sync: false
+      - key: SCRAPE_POSTS_LIMIT
+        value: "30"
+      - key: TRENDS_PER_DAY
+        value: "3"
+      # ── Notifications (optional) ──
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false

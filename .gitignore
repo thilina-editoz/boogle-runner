@@ -1,0 +1,17 @@
+# Dependencies — reinstalled via npm ci (and ffmpeg-static fetches the
+# platform-correct binary; the host's Windows ffmpeg.exe must never ship).
+node_modules/
+
+# Secrets — never commit. .env.example is the committed template.
+.env
+.env.*
+!.env.example
+
+# Ephemeral pipeline scratch
+output/
+trends/
+
+# Noise
+npm-debug.log*
+*.log
+.DS_Store

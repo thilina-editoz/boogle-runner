@@ -1,0 +1,23 @@
+# ─────────────────────────────────────────────────────────
+#  Boogle Pipeline Runner — local smoke test (Stage 11 Phase 2)
+#
+#  Builds the runner image and runs it with all config injected
+#  from .env at runtime (env_file) — nothing baked into the image.
+#  This mirrors how a customer's host (Railway / Render / Fly / VPS)
+#  injects env vars in production.
+#
+#  Usage:
+#    docker compose up --build      # build + run, stream logs
+#    docker compose down            # stop
+#
+#  Expect: the worker polls /api/internal/jobs/next and logs
+#  "Boogle worker started. Polling every 10s." With a valid
+#  BOOGLE_RUNNER_TOKEN + BOOGLE_DASHBOARD_URL it gets 200s (job: null)
+#  instead of 401s. See PLAN-RUNNER.md.
+# ─────────────────────────────────────────────────────────
+services:
+  runner:
+    build: .
+    image: boogle-runner:dev
+    env_file: .env
+    restart: unless-stopped

@@ -1,0 +1,23 @@
+# Host node_modules holds the Windows ffmpeg.exe — never copy it in;
+# npm ci re-installs and ffmpeg-static fetches the Linux binary.
+node_modules
+
+# Ephemeral pipeline scratch — written, uploaded to R2, discarded.
+output
+trends
+
+# Secrets — injected as env vars at runtime, never baked into the image.
+.env
+.env.*
+
+# Repo / build noise
+.git
+.gitignore
+.github
+npm-debug.log*
+Dockerfile
+.dockerignore
+docker-compose.yml
+railway.json
+render.yaml
+.env.example
