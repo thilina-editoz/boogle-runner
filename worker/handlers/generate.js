@@ -12,9 +12,28 @@
 //   - else                  → error (need something to generate)
 // ─────────────────────────────────────────────────────────
 
+const fs   = require('fs');
+const os   = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 const { updatePieceStatus } = require('../api');
+
+// Write the EDL (when the dashboard Director produced one) to a temp file
+// and return its path so we can hand generate.js `--edl <path>`. Inline
+// JSON on argv would be fragile at EDL sizes; a temp file is robust and
+// the executor reads it the same way. Returns null when there's no EDL.
+function writeEdlTemp(job) {
+  const edl = job && job.payload && job.payload.edl;
+  if (!edl || typeof edl !== 'object') return null;
+  try {
+    const file = path.join(os.tmpdir(), `boogle-edl-${job.id}.json`);
+    fs.writeFileSync(file, JSON.stringify(edl));
+    return file;
+  } catch (err) {
+    console.error(`    [generate] could not stage EDL temp file: ${err.message}`);
+    return null;
+  }
+}
 
 const PIPELINE_ROOT   = path.resolve(__dirname, '..', '..');
 const GENERATE_SCRIPT = path.join(PIPELINE_ROOT, 'generate.js');
@@ -70,7 +89,18 @@ async function handleGenerate(job) {
   if (job.brand_id)  args.push('--brand', job.brand_id);
   if (job.target_id) args.push('--content-piece', job.target_id);
 
-  const { stdout } = await runScript(GENERATE_SCRIPT, args);
+  // Edit Brain (Stage 12.3): hand generate.js the EDL when present. It's
+  // only acted on if EDIT_BRAIN_EXECUTOR is on AND the EDL is valid;
+  // otherwise generate.js ignores it and renders the legacy way.
+  const edlPath = writeEdlTemp(job);
+  if (edlPath) args.push('--edl', edlPath);
+
+  let stdout;
+  try {
+    ({ stdout } = await runScript(GENERATE_SCRIPT, args));
+  } finally {
+    if (edlPath) { try { fs.unlinkSync(edlPath); } catch { /* best-effort cleanup */ } }
+  }
 
   // Generate succeeded — flip the piece to 'review' so it shows up in
   // the dashboard's review queue, then fire piece_ready over Telegram.

@@ -22,6 +22,7 @@ const https      = require('https');
 const { postContent } = require('./post');
 const { uploadToR2 } = require('./r2-upload');
 const { loadBrandConfig, withFallbacks } = require('./worker/brand-config');
+const { isExecutorEnabled, loadEdl, isValidEdl, composeFromEdl } = require('./edit-brain/executor');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -43,9 +44,14 @@ function readFlag(name) {
 const BRAND_ID         = readFlag('--brand');
 const CONTENT_PIECE_ID = readFlag('--content-piece') || process.env.BOOGLE_CONTENT_PIECE_ID || null;
 
+// Edit Brain EDL (Stage 12.3). Passed by the worker as `--edl <tmpfile>`
+// (or BOOGLE_EDL_JSON). Only consumed when EDIT_BRAIN_EXECUTOR is on AND
+// the EDL is schema-valid — otherwise the legacy single-shot path runs.
+const EDL = loadEdl();
+
 // Positional args (topic, caption style) excluding the named flags
 const POSITIONAL = (() => {
-  const skip = new Set(['--brand', '--content-piece']);
+  const skip = new Set(['--brand', '--content-piece', '--edl']);
   const out = [];
   for (let i = 2; i < process.argv.length; i++) {
     if (skip.has(process.argv[i])) { i++; continue; }
@@ -105,11 +111,9 @@ function getTopic() {
       const trends = JSON.parse(fs.readFileSync(trendsPath, 'utf8'));
       const top    = trends.topics?.[0];
       if (top?.topic) {
-        console.log("
-  📈  Auto-picked from today's trends:");
+        console.log("\n  📈  Auto-picked from today's trends:");
         console.log('      "' + top.topic + '"');
-        console.log('      Hook: "' + top.hook + '"
-');
+        console.log('      Hook: "' + top.hook + '"\n');
         return { topic: top.topic, hook: top.hook, fromTrends: true };
       }
     } catch {}
@@ -638,13 +642,37 @@ async function run() {
 
     // ── Step 6: Burn captions ───────────────────────────
     if (videoPath && captions.file) {
-      try {
-        const finalPath = await burnCaptions(videoPath, captions.file, folder);
-        pipelineState.steps.finalVideo = { status: 'done', file: 'final_video.mp4' };
-      } catch (burnErr) {
-        log('error', `Caption burn failed: ${burnErr.message}`);
-        pipelineState.steps.finalVideo = { status: 'failed', reason: burnErr.message };
-        console.log('         → Video saved without captions as avatar_video.mp4');
+      let rendered = false;
+
+      // ── Edit Brain executor (Stage 12.3) — flag-gated, best-effort ──
+      // When EDIT_BRAIN_EXECUTOR is on and the dashboard supplied a valid
+      // EDL, render through the executor (safe-zone caption placement +
+      // music bed). ANY failure falls through to the legacy single-shot
+      // burn below, so a bad EDL can never regress a working render.
+      if (isExecutorEnabled() && isValidEdl(EDL)) {
+        try {
+          await composeFromEdl({ edl: EDL, videoPath, srtPath: captions.file, folder, captionStyle });
+          pipelineState.steps.finalVideo = { status: 'done', file: 'final_video.mp4', via: 'edit-brain' };
+          pipelineState.editBrain = { used: true, platform: EDL.platform, segments: EDL.segments.length };
+          log('done', 'Edit Brain executor render → final_video.mp4');
+          rendered = true;
+        } catch (edlErr) {
+          log('error', `Edit Brain executor failed: ${edlErr.message} — falling back to legacy burn`);
+          pipelineState.editBrain = { used: false, reason: edlErr.message };
+        }
+      } else if (EDL && !isValidEdl(EDL)) {
+        pipelineState.editBrain = { used: false, reason: 'EDL present but invalid' };
+      }
+
+      if (!rendered) {
+        try {
+          const finalPath = await burnCaptions(videoPath, captions.file, folder);
+          pipelineState.steps.finalVideo = { status: 'done', file: 'final_video.mp4' };
+        } catch (burnErr) {
+          log('error', `Caption burn failed: ${burnErr.message}`);
+          pipelineState.steps.finalVideo = { status: 'failed', reason: burnErr.message };
+          console.log('         → Video saved without captions as avatar_video.mp4');
+        }
       }
     } else {
       pipelineState.steps.finalVideo = {
@@ -701,10 +729,8 @@ async function run() {
         };
 
       } else {
-        const captionMatch = script.match(/─── POST CAPTION ───
-([\s\S]*?)─── HASHTAGS/);
-        const hashtagMatch = script.match(/─── HASHTAGS ───
-([\s\S]*?)─── HOOK ALTERNATIVE/);
+        const captionMatch = script.match(/─── POST CAPTION ───\n([\s\S]*?)─── HASHTAGS/);
+        const hashtagMatch = script.match(/─── HASHTAGS ───\n([\s\S]*?)─── HOOK ALTERNATIVE/);
         const caption      = captionMatch ? captionMatch[1].trim() : topic;
         const hashtags     = hashtagMatch ? hashtagMatch[1].trim() : '';
 
