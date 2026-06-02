@@ -116,6 +116,23 @@ async function recordTrendingSounds(sounds) {
   }
 }
 
+// ── Editing patterns (Edit Brain learning loop, Stage 12.5) ──
+// Fire-and-forget write path for mined editing techniques from top posts.
+// The Director reads these back to bias the EDL. NEVER throws — a flaky
+// report must not fail a scrape. NOTE: no caller yet — genuine pattern
+// mining (avg shot length, shot count, …) needs shot-level video analysis
+// we don't run today. This is the ready integration point for that miner;
+// pass { pattern_data, source_platform?, source_post_url?, source_views?,
+// effectiveness_score? } rows.
+async function recordEditingPatterns(patterns) {
+  if (!Array.isArray(patterns) || patterns.length === 0) return { ok: false, reason: 'no patterns' };
+  try {
+    return await call('POST', '/api/internal/editing-patterns', { patterns });
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+}
+
 module.exports = {
   getNextJob,
   completeJob,
@@ -126,4 +143,5 @@ module.exports = {
   insertPosts,
   resolveAssets,
   recordTrendingSounds,
+  recordEditingPatterns,
 };
