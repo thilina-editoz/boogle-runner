@@ -11,20 +11,21 @@
 //  the flag off (the default), generate.js renders exactly as it did
 //  before — single avatar shot + the legacy caption burn.
 //
-//  What's ACTIVE today:
+//  What's ACTIVE:
 //   • Safe-zone-aware caption placement — the EDL's caption position +
 //     the platform safe zone drive libass alignment/margin, instead of
-//     the caption style's fixed MarginV. This is renderable now from the
-//     avatar video + the SRT we already build.
-//   • Music bed with fades + ducking — wired and correct, but only fires
-//     when a music track resolves. Resolution lands with the asset
-//     libraries in Stage 12.4, so it's a graceful no-op until then.
+//     the caption style's fixed MarginV.
+//   • Music bed with fades + ducking — fires when the Director matched a
+//     music asset (resolveAssets downloads it from R2 via the broker).
+//   • Multi-shot b-roll cutaways — each EDL segment with layer='broll' and
+//     a matched asset is composited over the avatar during its [t_in,t_out]
+//     window (buildCompositeGraph). Avatar shows through any gap.
+//  Each layer is independent: with no matched assets the render degrades
+//  cleanly to "avatar + safe-zone captions".
 //
-//  Scaffolded for 12.4 (intentionally NOT yet wired into ffmpeg, so we
-//  don't ship dead, untestable filter graphs):
-//   • Multi-shot b-roll cutaways and SFX one-shots — these need resolved
-//     `assets` rows, which don't exist until 12.4. resolveAssets() is the
-//     single seam where that retrieval will plug in.
+//  Still deferred: timed SFX one-shots and full-screen `card` segments —
+//  the broker returns the rows; the mixer/renderer for them is a later
+//  refinement. resolveAssets() is the seam where SFX retrieval plugs in.
 //
 //  Always best-effort: composeFromEdl throws on any ffmpeg/parse error and
 //  the caller falls back to the legacy single-shot burn. The EDL must
@@ -129,12 +130,13 @@ function ffSubtitlesPath(srtPath) {
 // signed R2 URL, download it, hand the path to composeFromEdl which mixes
 // the ducked bed. Brand scoping + R2 creds stay server-side.
 //
-// Fully best-effort: no music asset, no runner token, a broker/download
-// failure — all degrade to "avatar + safe-zone captions" with a log line,
-// never an exception. B-roll/SFX resolution is intentionally deferred
-// until the Executor grows a multi-shot compositor (a later phase) — the
-// broker already returns those rows, there's just nothing to render them
-// into yet.
+// Fully best-effort: no assets, no runner token, a broker/download
+// failure — all degrade gracefully (avatar + safe-zone captions) with a
+// log line, never an exception. Resolves BOTH the music bed and the
+// per-segment b-roll clips the Director matched; the compositor below
+// cuts the b-roll over the avatar during each segment's window. SFX
+// one-shots are still deferred (the broker returns them; the mixer for
+// timed one-shots is a later refinement).
 async function downloadTo(url, dest) {
   const res = await fetch(url);
   if (!res.ok) throw new Error(`download ${res.status}`);
@@ -146,23 +148,58 @@ async function downloadTo(url, dest) {
   return dest;
 }
 
+// Cap on simultaneous b-roll cutaways — keeps the ffmpeg filter graph
+// (one scale+overlay pair per clip) sane on a small runner box.
+const MAX_BROLL_CLIPS = 12;
+
 async function resolveAssets(edl, folder) {
-  const out = { music: null, sfx: [], brollBySegment: {} };
+  const out = { music: null, sfx: [], broll: [] };
   try {
     const musicId = edl && edl.music && edl.music.asset_id;
-    if (!musicId) return out;
+
+    // Segments the Director matched to a real b-roll asset, in timeline order.
+    const brollSegs = (edl.segments || [])
+      .map((s, i) => ({ i, s }))
+      .filter(({ s }) => s && s.layer === 'broll' && s.asset_id && Number(s.t_out) > Number(s.t_in))
+      .slice(0, MAX_BROLL_CLIPS);
+
+    const ids = [];
+    if (musicId) ids.push(musicId);
+    for (const { s } of brollSegs) ids.push(s.asset_id);
+    if (ids.length === 0) return out;
 
     const { resolveAssets: brokerResolve } = require('../worker/api');
-    const assets = await brokerResolve([musicId]);
-    const m = (assets || []).find((a) => a.id === musicId && a.type === 'music')
-          || (assets || []).find((a) => a.type === 'music');
-    if (!m || !m.url) return out;
+    const assets = await brokerResolve(Array.from(new Set(ids)));
+    const byId = new Map((assets || []).map((a) => [a.id, a]));
 
-    const ext  = path.extname(m.r2_key || '') || '.mp3';
-    const dest = path.join(folder, 'assets', `music${ext}`);
-    await downloadTo(m.url, dest);
-    out.music = { path: dest, duration_s: m.duration_s != null ? Number(m.duration_s) : null, title: m.title || null };
-    console.log(`  [edit-brain] resolved music asset → assets/music${ext}${m.duration_s ? ` (${m.duration_s}s)` : ''}`);
+    // Music bed.
+    if (musicId) {
+      const m = byId.get(musicId) || (assets || []).find((a) => a.type === 'music');
+      if (m && m.url) {
+        const ext  = path.extname(m.r2_key || '') || '.mp3';
+        const dest = path.join(folder, 'assets', `music${ext}`);
+        await downloadTo(m.url, dest);
+        out.music = { path: dest, duration_s: m.duration_s != null ? Number(m.duration_s) : null, title: m.title || null };
+        console.log(`  [edit-brain] resolved music asset → assets/music${ext}${m.duration_s ? ` (${m.duration_s}s)` : ''}`);
+      }
+    }
+
+    // B-roll cutaways — one downloaded clip per matched segment.
+    let n = 0;
+    for (const { i, s } of brollSegs) {
+      const a = byId.get(s.asset_id);
+      if (!a || !a.url || a.type !== 'broll') continue;
+      const ext  = path.extname(a.r2_key || '') || '.mp4';
+      const dest = path.join(folder, 'assets', `broll_${i}${ext}`);
+      try {
+        await downloadTo(a.url, dest);
+        out.broll.push({ segIndex: i, t_in: Number(s.t_in), t_out: Number(s.t_out), path: dest });
+        n++;
+      } catch (e) {
+        console.error(`  [edit-brain] b-roll seg ${i} download failed: ${e.message}`);
+      }
+    }
+    if (n) console.log(`  [edit-brain] resolved ${n} b-roll clip(s)`);
   } catch (err) {
     console.error(`  [edit-brain] asset resolution skipped: ${err.message}`);
   }
@@ -172,6 +209,55 @@ async function resolveAssets(edl, folder) {
 function dbToLinear(db) {
   const n = Number(db);
   return Number.isFinite(n) ? Math.pow(10, n / 20) : 1;
+}
+
+// Build the ffmpeg filter graph + output map for the b-roll/music
+// composite. Pure (no ffmpeg, no fs) so the graph can be unit-tested.
+// Input order assumed by the labels: [0]=avatar, [1..B]=broll, [B+1]=music.
+//   broll: [{ t_in, t_out, path }] (path unused here — caller adds inputs)
+//   music: { duration_s } | null   edlMusic: edl.music | null
+function buildCompositeGraph({ subFilter, broll, music, edlMusic }) {
+  const parts = [];
+
+  // VIDEO — cut each b-roll over the avatar during its [t_in,t_out] window,
+  // scaled to fill the vertical frame and started from its head at t_in.
+  // eof_action=pass → a clip shorter than its window lets the avatar show.
+  let last = '0:v';
+  broll.forEach((b, k) => {
+    const inIdx = 1 + k;
+    parts.push(
+      `[${inIdx}:v]scale=1080:1920:force_original_aspect_ratio=increase,` +
+      `crop=1080:1920,setpts=PTS-STARTPTS+${b.t_in}/TB[bv${k}]`
+    );
+    parts.push(
+      `[${last}][bv${k}]overlay=enable='between(t,${b.t_in},${b.t_out})':eof_action=pass[ov${k}]`
+    );
+    last = `ov${k}`;
+  });
+  parts.push(`[${last}]${subFilter}[v]`);
+
+  // AUDIO — voiceover always; duck a faded music bed under it when present.
+  let audioMap = '0:a';
+  if (music) {
+    const duck    = Number(edlMusic && edlMusic.duck_db   != null ? edlMusic.duck_db   : DEFAULT_DUCK_DB);
+    const fadeIn  = Number(edlMusic && edlMusic.fade_in_s != null ? edlMusic.fade_in_s : DEFAULT_FADE_IN_S);
+    const fadeOut = Number(edlMusic && edlMusic.fade_out_s != null ? edlMusic.fade_out_s : DEFAULT_FADE_OUT_S);
+    const dur     = Number(music.duration_s) > 0 ? Number(music.duration_s) : null;
+    const musicInIdx = 1 + broll.length;
+    const musicChain = [
+      `volume=${dbToLinear(duck).toFixed(4)}`,
+      `afade=t=in:st=0:d=${fadeIn}`,
+      dur ? `afade=t=out:st=${Math.max(0, dur - fadeOut).toFixed(2)}:d=${fadeOut}` : null,
+    ].filter(Boolean).join(',');
+    parts.push(`[${musicInIdx}:a]${musicChain}[mus]`);
+    // duration=first → end with the voiceover, not the music bed.
+    parts.push(`[0:a][mus]amix=inputs=2:duration=first:dropout_transition=0[a]`);
+    audioMap = '[a]';
+  }
+
+  const mapOpts = ['-map', '[v]', '-map', audioMap];
+  if (music) mapOpts.push('-shortest');
+  return { parts, mapOpts };
 }
 
 // ── Render ────────────────────────────────────────────────
@@ -193,45 +279,37 @@ async function composeFromEdl({ edl, videoPath, srtPath, folder, captionStyle })
   });
   const subFilter = `subtitles='${ffSubtitlesPath(srtPath)}':force_style='${styleStr}'`;
 
-  const { music } = await resolveAssets(edl, folder);
+  const { music, broll } = await resolveAssets(edl, folder);
   const outputPath = path.join(folder, 'final_video.mp4');
+  const hasBroll = broll.length > 0;
+  const hasMusic = !!(music && music.path && fs.existsSync(music.path));
 
   console.log(
     `  [edit-brain] executor render — platform=${placed.platform} ` +
     `captions=${placed.position}(an${placed.alignment},mv${placed.marginV}) ` +
-    `music=${music ? 'yes' : 'none'} segments=${edl.segments.length}`
+    `music=${hasMusic ? 'yes' : 'none'} broll=${broll.length} segments=${edl.segments.length}`
   );
 
   await new Promise((resolve, reject) => {
     const cmd = ffmpeg(videoPath);
 
-    if (music && music.path && fs.existsSync(music.path)) {
-      // Avatar video + a ducked, faded music bed under the voiceover.
-      // Constant duck (music attenuated to duck_db under the VO) — robust
-      // without needing the music track's duration up front. Sidechain
-      // ducking is a later refinement.
-      const duck    = Number(edl.music && edl.music.duck_db != null ? edl.music.duck_db : DEFAULT_DUCK_DB);
-      const fadeIn  = Number(edl.music && edl.music.fade_in_s != null ? edl.music.fade_in_s : DEFAULT_FADE_IN_S);
-      const fadeOut = Number(edl.music && edl.music.fade_out_s != null ? edl.music.fade_out_s : DEFAULT_FADE_OUT_S);
-      const dur     = Number(music.duration_s) > 0 ? Number(music.duration_s) : null;
-
-      const musicChain = [
-        `volume=${dbToLinear(duck).toFixed(4)}`,
-        `afade=t=in:st=0:d=${fadeIn}`,
-        dur ? `afade=t=out:st=${Math.max(0, dur - fadeOut).toFixed(2)}:d=${fadeOut}` : null,
-      ].filter(Boolean).join(',');
-
-      cmd.input(music.path);
-      cmd.complexFilter([
-        `[0:v]${subFilter}[v]`,
-        `[1:a]${musicChain}[mus]`,
-        // duration=first → end with the voiceover, not the music bed.
-        `[0:a][mus]amix=inputs=2:duration=first:dropout_transition=0[a]`,
-      ]);
-      cmd.outputOptions(['-map', '[v]', '-map', '[a]', '-shortest']);
-    } else {
-      // No resolvable music → avatar video + safe-zone captions only.
+    if (!hasBroll && !hasMusic) {
+      // Simplest path — avatar video + safe-zone captions only.
       cmd.videoFilters(subFilter);
+    } else {
+      // Inputs in a FIXED order so the filter labels line up:
+      //   [0] = avatar (the base), [1..B] = b-roll clips, [B+1] = music.
+      broll.forEach((b) => cmd.input(b.path));
+      if (hasMusic) cmd.input(music.path);
+
+      const { parts, mapOpts } = buildCompositeGraph({
+        subFilter,
+        broll,
+        music: hasMusic ? music : null,
+        edlMusic: edl.music || null,
+      });
+      cmd.complexFilter(parts);
+      cmd.outputOptions(mapOpts);
     }
 
     cmd
@@ -252,6 +330,7 @@ module.exports = {
   loadEdl,
   isValidEdl,
   composeFromEdl,
+  buildCompositeGraph,
   // exported for unit reasoning / future reuse
   captionPlacement,
   applyStyleOverrides,
