@@ -33,6 +33,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { Readable } = require('stream');
 const ffmpeg = require('fluent-ffmpeg');
 const {
   safeZoneFor,
@@ -121,14 +122,51 @@ function ffSubtitlesPath(srtPath) {
   return srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
 }
 
-// ── Asset resolution (12.4 seam) ──────────────────────────
-// Today this returns nothing resolvable: the Director leaves asset_id
-// null (no library yet), and the runner has no R2 fetch for assets. The
-// whole multi-shot / music / sfx layer therefore degrades to "avatar +
-// safe-zone captions". Stage 12.4 implements real tag-based matching +
-// R2 download here and the render paths below light up unchanged.
-async function resolveAssets(/* edl, folder */) {
-  return { music: null, sfx: [], brollBySegment: {} };
+// ── Asset resolution (Stage 12.4) ─────────────────────────
+// The Director stamps real asset ids onto the EDL (dashboard-side, by
+// tag/fingerprint match against the `assets` table). Here we turn the
+// MUSIC asset id into a local file: ask the dashboard broker for a
+// signed R2 URL, download it, hand the path to composeFromEdl which mixes
+// the ducked bed. Brand scoping + R2 creds stay server-side.
+//
+// Fully best-effort: no music asset, no runner token, a broker/download
+// failure — all degrade to "avatar + safe-zone captions" with a log line,
+// never an exception. B-roll/SFX resolution is intentionally deferred
+// until the Executor grows a multi-shot compositor (a later phase) — the
+// broker already returns those rows, there's just nothing to render them
+// into yet.
+async function downloadTo(url, dest) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`download ${res.status}`);
+  await fs.promises.mkdir(path.dirname(dest), { recursive: true });
+  await new Promise((resolve, reject) => {
+    const out = fs.createWriteStream(dest);
+    Readable.fromWeb(res.body).pipe(out).on('finish', resolve).on('error', reject);
+  });
+  return dest;
+}
+
+async function resolveAssets(edl, folder) {
+  const out = { music: null, sfx: [], brollBySegment: {} };
+  try {
+    const musicId = edl && edl.music && edl.music.asset_id;
+    if (!musicId) return out;
+
+    const { resolveAssets: brokerResolve } = require('../worker/api');
+    const assets = await brokerResolve([musicId]);
+    const m = (assets || []).find((a) => a.id === musicId && a.type === 'music')
+          || (assets || []).find((a) => a.type === 'music');
+    if (!m || !m.url) return out;
+
+    const ext  = path.extname(m.r2_key || '') || '.mp3';
+    const dest = path.join(folder, 'assets', `music${ext}`);
+    await downloadTo(m.url, dest);
+    out.music = { path: dest, duration_s: m.duration_s != null ? Number(m.duration_s) : null, title: m.title || null };
+    console.log(`  [edit-brain] resolved music asset → assets/music${ext}${m.duration_s ? ` (${m.duration_s}s)` : ''}`);
+  } catch (err) {
+    console.error(`  [edit-brain] asset resolution skipped: ${err.message}`);
+  }
+  return out;
 }
 
 function dbToLinear(db) {

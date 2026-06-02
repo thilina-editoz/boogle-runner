@@ -94,6 +94,28 @@ async function insertPosts(rows) {
   return written ?? 0;
 }
 
+// ── Assets (Edit Brain — resolve EDL asset ids → signed URLs) ──
+// Given the asset ids the Director stamped onto the EDL, the dashboard
+// returns short-lived signed R2 GET URLs (brand-scoped server-side). The
+// runner never sees R2 credentials. Returns [] on no ids.
+async function resolveAssets(assetIds) {
+  if (!Array.isArray(assetIds) || assetIds.length === 0) return [];
+  const { assets } = await call('POST', '/api/internal/assets/resolve', { asset_ids: assetIds });
+  return assets ?? [];
+}
+
+// ── Trending sounds (Edit Brain trend radar) ──────────────
+// Fire-and-forget: NEVER throws. A flaky trend report must not fail a
+// scrape. Returns the broker payload or a {ok:false} marker.
+async function recordTrendingSounds(sounds) {
+  if (!Array.isArray(sounds) || sounds.length === 0) return { ok: false, reason: 'no sounds' };
+  try {
+    return await call('POST', '/api/internal/trending-sounds', { sounds });
+  } catch (err) {
+    return { ok: false, reason: err.message };
+  }
+}
+
 module.exports = {
   getNextJob,
   completeJob,
@@ -102,4 +124,6 @@ module.exports = {
   insertIdeas,
   updatePieceStatus,
   insertPosts,
+  resolveAssets,
+  recordTrendingSounds,
 };
