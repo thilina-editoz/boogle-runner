@@ -16,6 +16,7 @@ require('dotenv').config();
 const Anthropic = require('@anthropic-ai/sdk');
 const fs        = require('fs');
 const path      = require('path');
+const { recordUsage, anthropicCostUsd } = require('./worker/usage');
 
 const APIFY_BASE = 'https://api.apify.com/v2';
 const PRINT_MODE = process.argv.includes('--print');
@@ -107,6 +108,9 @@ async function runApifyActor(actorId, input) {
 
     if (status === 'SUCCEEDED') {
       console.log('');
+      // Report exact Apify spend for this run (fire-and-forget).
+      const apifyCost = Number(statusData.data?.usageTotalUsd ?? 0);
+      if (apifyCost > 0) await recordUsage({ provider: 'apify', spendUsd: apifyCost });
       break;
     }
     if (status === 'FAILED' || status === 'ABORTED' || status === 'TIMED-OUT') {
@@ -157,6 +161,12 @@ async function scrapeTikTok() {
         shares:      item.shareCount      || item.stats?.shareCount      || 0,
         author:      item.authorMeta?.name || item.author?.nickname || 'unknown',
         url:         item.webVideoUrl     || item.url || '',
+        // Trending-sound metadata (Edit Brain). Apify clockworks/tiktok-scraper
+        // returns musicMeta; field names vary, so read defensively.
+        musicId:     item.musicMeta?.musicId     || item.musicMeta?.id         || null,
+        musicName:   item.musicMeta?.musicName   || item.musicMeta?.title      || null,
+        musicAuthor: item.musicMeta?.musicAuthor || item.musicMeta?.authorName || null,
+        musicUrl:    item.musicMeta?.playUrl     || item.musicMeta?.musicUrl   || null,
       }))
       .sort((a, b) => b.views - a.views)
       .slice(0, config.postsLimit);
@@ -193,6 +203,12 @@ async function scrapeInstagram() {
         shares:      0,
         author:      item.ownerUsername   || 'unknown',
         url:         item.url             || item.shortCode ? `https://instagram.com/p/${item.shortCode}` : '',
+        // Trending-sound metadata (Edit Brain). apify/instagram-scraper exposes
+        // musicInfo on reels; absent on photos — null is fine.
+        musicId:     item.musicInfo?.audio_id    || null,
+        musicName:   item.musicInfo?.song_name   || null,
+        musicAuthor: item.musicInfo?.artist_name || null,
+        musicUrl:    null,
       }))
       .sort((a, b) => b.likes - a.likes)
       .slice(0, config.postsLimit);
@@ -275,6 +291,16 @@ Respond ONLY with valid JSON — no text before or after. Use this exact format:
     model: 'claude-sonnet-4-6',
     max_tokens: 1500,
     messages: [{ role: 'user', content: prompt }]
+  });
+
+  // Report exact Anthropic spend from the SDK's token counts (fire-and-forget).
+  await recordUsage({
+    provider: 'anthropic',
+    spendUsd: anthropicCostUsd(
+      'claude-sonnet-4-6',
+      response.usage?.input_tokens,
+      response.usage?.output_tokens
+    ),
   });
 
   const raw = response.content[0].text.trim();
@@ -389,6 +415,11 @@ async function insertContentIdeas(brandId, topics, allPosts) {
                 title: idea.topic,
                 format: idea.format || 'reel',
                 platform: idea.platform,
+                // Inspiration context so the Telegram message can link
+                // to the original post (returned by /api/internal/ideas).
+                source: idea.source ?? null,
+                sourceUrl: idea.source_url ?? null,
+                sourceViews: idea.source_views ?? null,
               },
             },
           })
@@ -490,6 +521,27 @@ async function run() {
     ];
 
     log('done', `Scraped ${allPosts.length} posts total`);
+
+    // Record trending sounds for the Edit Brain (fire-and-forget — never fatal).
+    try {
+      const { recordTrendingSounds } = require('./worker/api');
+      const sounds = allPosts
+        .filter(p => p.musicId)
+        .map(p => ({
+          platform:          p.platform,
+          external_sound_id: String(p.musicId),
+          title:             p.musicName   || null,
+          author:            p.musicAuthor || null,
+          play_url:          p.musicUrl    || null,
+        }));
+      if (sounds.length) {
+        const r = await recordTrendingSounds(sounds);
+        if (r && r.ok) log('done', `Recorded ${r.upserted ?? sounds.length} trending sound(s)`);
+        else log('step', `Trending-sound capture skipped (${r?.reason || 'none'})`);
+      }
+    } catch (err) {
+      log('error', `trending-sound capture failed (non-fatal): ${err.message}`);
+    }
 
     // Sort by engagement score
     allPosts.sort((a, b) => engagementScore(b) - engagementScore(a));
