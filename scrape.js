@@ -161,6 +161,8 @@ async function scrapeTikTok() {
         shares:      item.shareCount      || item.stats?.shareCount      || 0,
         author:      item.authorMeta?.name || item.author?.nickname || 'unknown',
         url:         item.webVideoUrl     || item.url || '',
+        // Runtime in seconds (Edit Brain miner) — clockworks exposes videoMeta.duration.
+        durationS:   item.videoMeta?.duration ?? null,
         // Trending-sound metadata (Edit Brain). Apify clockworks/tiktok-scraper
         // returns musicMeta; field names vary, so read defensively.
         musicId:     item.musicMeta?.musicId     || item.musicMeta?.id         || null,
@@ -203,6 +205,8 @@ async function scrapeInstagram() {
         shares:      0,
         author:      item.ownerUsername   || 'unknown',
         url:         item.url             || item.shortCode ? `https://instagram.com/p/${item.shortCode}` : '',
+        // Runtime in seconds (Edit Brain miner) — IG scraper exposes videoDuration on reels.
+        durationS:   item.videoDuration ?? null,
         // Trending-sound metadata (Edit Brain). apify/instagram-scraper exposes
         // musicInfo on reels; absent on photos — null is fine.
         musicId:     item.musicInfo?.audio_id    || null,
@@ -545,6 +549,36 @@ async function run() {
 
     // Sort by engagement score
     allPosts.sort((a, b) => engagementScore(b) - engagementScore(a));
+
+    // Mine editing patterns for the Edit Brain learning loop (fire-and-forget).
+    // v1 is METADATA ONLY — runtime + engagement + sound, no shot-level video
+    // analysis (that needs downloading videos; deferred for cost). The Director
+    // reads these back to bias target_duration_s + the edit. Dedupes on url.
+    try {
+      const { recordEditingPatterns } = require('./worker/api');
+      const patterns = allPosts
+        .filter(p => p.url)
+        .slice(0, 10)
+        .map(p => ({
+          source_platform:     p.platform,
+          source_post_url:     p.url,
+          source_views:        p.views || 0,
+          effectiveness_score: Math.round(engagementScore(p) * 100) / 100,
+          pattern_data: {
+            duration_s:    p.durationS != null ? Number(p.durationS) : null,
+            music_id:      p.musicId ? String(p.musicId) : null,
+            caption_len:   p.description ? p.description.length : null,
+            hashtag_count: (p.description.match(/#/g) || []).length,
+          },
+        }));
+      if (patterns.length) {
+        const r = await recordEditingPatterns(patterns);
+        if (r && r.ok) log('done', `Recorded ${r.recorded ?? patterns.length} editing pattern(s)`);
+        else log('step', `Editing-pattern capture skipped (${r?.reason || 'none'})`);
+      }
+    } catch (err) {
+      log('error', `editing-pattern capture failed (non-fatal): ${err.message}`);
+    }
 
     // Print top posts if requested
     if (PRINT_MODE) {
