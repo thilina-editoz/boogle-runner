@@ -20,12 +20,14 @@
 //   • Multi-shot b-roll cutaways — each EDL segment with layer='broll' and
 //     a matched asset is composited over the avatar during its [t_in,t_out]
 //     window (buildCompositeGraph). Avatar shows through any gap.
+//   • SFX one-shots — each segment's Director-resolved sfx asset id is mixed
+//     in as a delayed one-shot (adelay) at the segment onset, amix'd over
+//     the VO (normalize=0 keeps the voiceover at full level).
 //  Each layer is independent: with no matched assets the render degrades
 //  cleanly to "avatar + safe-zone captions".
 //
-//  Still deferred: timed SFX one-shots and full-screen `card` segments —
-//  the broker returns the rows; the mixer/renderer for them is a later
-//  refinement. resolveAssets() is the seam where SFX retrieval plugs in.
+//  Still deferred: full-screen `card` segments (text beats) — would need
+//  drawtext + a bundled font on the runner image; left for a later pass.
 //
 //  Always best-effort: composeFromEdl throws on any ffmpeg/parse error and
 //  the caller falls back to the legacy single-shot burn. The EDL must
@@ -151,6 +153,14 @@ async function downloadTo(url, dest) {
 // Cap on simultaneous b-roll cutaways — keeps the ffmpeg filter graph
 // (one scale+overlay pair per clip) sane on a small runner box.
 const MAX_BROLL_CLIPS = 12;
+// Cap on sfx one-shots (one adelay+amix branch each).
+const MAX_SFX = 24;
+
+// A resolved sfx/asset id looks like a uuid; raw rulebook tags ("impact",
+// "whoosh") never will, so they harmlessly fail to resolve at the broker.
+function looksLikeAssetId(s) {
+  return typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-/i.test(s);
+}
 
 async function resolveAssets(edl, folder) {
   const out = { music: null, sfx: [], broll: [] };
@@ -163,9 +173,23 @@ async function resolveAssets(edl, folder) {
       .filter(({ s }) => s && s.layer === 'broll' && s.asset_id && Number(s.t_out) > Number(s.t_in))
       .slice(0, MAX_BROLL_CLIPS);
 
+    // SFX: segments carry sfx[] of Director-resolved asset ids (and/or raw
+    // tags that didn't resolve). Each id fires a one-shot at the segment's
+    // onset (t_in). Tags are dropped — they won't match an asset.
+    const sfxRefs = [];
+    for (const s of (edl.segments || [])) {
+      if (s && Array.isArray(s.sfx)) {
+        for (const entry of s.sfx) {
+          if (looksLikeAssetId(entry)) sfxRefs.push({ id: entry, atS: Number(s.t_in) || 0 });
+        }
+      }
+    }
+    const sfxCapped = sfxRefs.slice(0, MAX_SFX);
+
     const ids = [];
     if (musicId) ids.push(musicId);
     for (const { s } of brollSegs) ids.push(s.asset_id);
+    for (const r of sfxCapped) ids.push(r.id);
     if (ids.length === 0) return out;
 
     const { resolveAssets: brokerResolve } = require('../worker/api');
@@ -200,6 +224,31 @@ async function resolveAssets(edl, folder) {
       }
     }
     if (n) console.log(`  [edit-brain] resolved ${n} b-roll clip(s)`);
+
+    // SFX one-shots — download each unique sfx asset once, then place a
+    // one-shot at every segment that references it (fired at t_in).
+    const sfxPathById = new Map();
+    let sfxN = 0;
+    for (const r of sfxCapped) {
+      const a = byId.get(r.id);
+      if (!a || !a.url || a.type !== 'sfx') continue;
+      let p = sfxPathById.get(r.id);
+      if (!p) {
+        const ext = path.extname(a.r2_key || '') || '.mp3';
+        const dest = path.join(folder, 'assets', `sfx_${sfxPathById.size}${ext}`);
+        try {
+          await downloadTo(a.url, dest);
+          p = dest;
+          sfxPathById.set(r.id, dest);
+        } catch (e) {
+          console.error(`  [edit-brain] sfx download failed: ${e.message}`);
+          continue;
+        }
+      }
+      out.sfx.push({ atS: r.atS, path: p });
+      sfxN++;
+    }
+    if (sfxN) console.log(`  [edit-brain] resolved ${sfxN} sfx one-shot(s)`);
   } catch (err) {
     console.error(`  [edit-brain] asset resolution skipped: ${err.message}`);
   }
@@ -211,13 +260,15 @@ function dbToLinear(db) {
   return Number.isFinite(n) ? Math.pow(10, n / 20) : 1;
 }
 
-// Build the ffmpeg filter graph + output map for the b-roll/music
+// Build the ffmpeg filter graph + output map for the b-roll/music/sfx
 // composite. Pure (no ffmpeg, no fs) so the graph can be unit-tested.
-// Input order assumed by the labels: [0]=avatar, [1..B]=broll, [B+1]=music.
-//   broll: [{ t_in, t_out, path }] (path unused here — caller adds inputs)
-//   music: { duration_s } | null   edlMusic: edl.music | null
-function buildCompositeGraph({ subFilter, broll, music, edlMusic }) {
+// Input order assumed by the labels (caller MUST add inputs in this order):
+//   [0]=avatar, [1..B]=broll, then music (if any), then one input per sfx.
+//   broll: [{ t_in, t_out }]   music: { duration_s } | null
+//   sfx:   [{ atS }]           edlMusic: edl.music | null
+function buildCompositeGraph({ subFilter, broll, music, edlMusic, sfx }) {
   const parts = [];
+  const sfxList = Array.isArray(sfx) ? sfx : [];
 
   // VIDEO — cut each b-roll over the avatar during its [t_in,t_out] window,
   // scaled to fill the vertical frame and started from its head at t_in.
@@ -236,27 +287,47 @@ function buildCompositeGraph({ subFilter, broll, music, edlMusic }) {
   });
   parts.push(`[${last}]${subFilter}[v]`);
 
-  // AUDIO — voiceover always; duck a faded music bed under it when present.
-  let audioMap = '0:a';
+  // AUDIO — voiceover is always input [0]; layer a ducked/faded music bed
+  // and timed sfx one-shots over it, then amix (normalize=0 so the VO stays
+  // at full level instead of being attenuated by the input count).
+  let idx = 1 + broll.length;
+  const mix = ['0:a'];
+
   if (music) {
     const duck    = Number(edlMusic && edlMusic.duck_db   != null ? edlMusic.duck_db   : DEFAULT_DUCK_DB);
     const fadeIn  = Number(edlMusic && edlMusic.fade_in_s != null ? edlMusic.fade_in_s : DEFAULT_FADE_IN_S);
     const fadeOut = Number(edlMusic && edlMusic.fade_out_s != null ? edlMusic.fade_out_s : DEFAULT_FADE_OUT_S);
     const dur     = Number(music.duration_s) > 0 ? Number(music.duration_s) : null;
-    const musicInIdx = 1 + broll.length;
     const musicChain = [
       `volume=${dbToLinear(duck).toFixed(4)}`,
       `afade=t=in:st=0:d=${fadeIn}`,
       dur ? `afade=t=out:st=${Math.max(0, dur - fadeOut).toFixed(2)}:d=${fadeOut}` : null,
     ].filter(Boolean).join(',');
-    parts.push(`[${musicInIdx}:a]${musicChain}[mus]`);
-    // duration=first → end with the voiceover, not the music bed.
-    parts.push(`[0:a][mus]amix=inputs=2:duration=first:dropout_transition=0[a]`);
+    parts.push(`[${idx}:a]${musicChain}[mus]`);
+    mix.push('mus');
+    idx++;
+  }
+
+  sfxList.forEach((s, k) => {
+    const atMs = Math.max(0, Math.round((Number(s.atS) || 0) * 1000));
+    // adelay shifts the one-shot to its fire time (stereo → both channels).
+    parts.push(`[${idx}:a]adelay=${atMs}|${atMs}[sfx${k}]`);
+    mix.push(`sfx${k}`);
+    idx++;
+  });
+
+  let audioMap = '0:a';
+  if (mix.length > 1) {
+    // duration=first → end with the voiceover, not a trailing bed/sfx.
+    parts.push(
+      `${mix.map((l) => `[${l}]`).join('')}` +
+      `amix=inputs=${mix.length}:duration=first:dropout_transition=0:normalize=0[a]`
+    );
     audioMap = '[a]';
   }
 
   const mapOpts = ['-map', '[v]', '-map', audioMap];
-  if (music) mapOpts.push('-shortest');
+  if (mix.length > 1) mapOpts.push('-shortest');
   return { parts, mapOpts };
 }
 
@@ -279,34 +350,39 @@ async function composeFromEdl({ edl, videoPath, srtPath, folder, captionStyle })
   });
   const subFilter = `subtitles='${ffSubtitlesPath(srtPath)}':force_style='${styleStr}'`;
 
-  const { music, broll } = await resolveAssets(edl, folder);
+  const { music, broll, sfx } = await resolveAssets(edl, folder);
   const outputPath = path.join(folder, 'final_video.mp4');
   const hasBroll = broll.length > 0;
   const hasMusic = !!(music && music.path && fs.existsSync(music.path));
+  const sfxClips = (sfx || []).filter((s) => s && s.path && fs.existsSync(s.path));
+  const hasSfx = sfxClips.length > 0;
 
   console.log(
     `  [edit-brain] executor render — platform=${placed.platform} ` +
     `captions=${placed.position}(an${placed.alignment},mv${placed.marginV}) ` +
-    `music=${hasMusic ? 'yes' : 'none'} broll=${broll.length} segments=${edl.segments.length}`
+    `music=${hasMusic ? 'yes' : 'none'} broll=${broll.length} sfx=${sfxClips.length} ` +
+    `segments=${edl.segments.length}`
   );
 
   await new Promise((resolve, reject) => {
     const cmd = ffmpeg(videoPath);
 
-    if (!hasBroll && !hasMusic) {
+    if (!hasBroll && !hasMusic && !hasSfx) {
       // Simplest path — avatar video + safe-zone captions only.
       cmd.videoFilters(subFilter);
     } else {
       // Inputs in a FIXED order so the filter labels line up:
-      //   [0] = avatar (the base), [1..B] = b-roll clips, [B+1] = music.
+      //   [0]=avatar, [1..B]=b-roll, then music (if any), then each sfx.
       broll.forEach((b) => cmd.input(b.path));
       if (hasMusic) cmd.input(music.path);
+      sfxClips.forEach((s) => cmd.input(s.path));
 
       const { parts, mapOpts } = buildCompositeGraph({
         subFilter,
         broll,
         music: hasMusic ? music : null,
         edlMusic: edl.music || null,
+        sfx: sfxClips,
       });
       cmd.complexFilter(parts);
       cmd.outputOptions(mapOpts);
