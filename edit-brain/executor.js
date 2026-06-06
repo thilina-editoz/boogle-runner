@@ -26,8 +26,10 @@
 //  Each layer is independent: with no matched assets the render degrades
 //  cleanly to "avatar + safe-zone captions".
 //
-//  Still deferred: full-screen `card` segments (text beats) — would need
-//  drawtext + a bundled font on the runner image; left for a later pass.
+//   • Full-screen `card` segments (text beats) — Stage 12 TASK 2a — a dark
+//     scrim + centered headline (+ optional sub) drawn during each card
+//     segment window via drawtext, using a bundled DejaVu Sans font (the
+//     node:20-slim image has none). Adds no inputs (pure filtergraph).
 //
 //  Always best-effort: composeFromEdl throws on any ffmpeg/parse error and
 //  the caller falls back to the legacy single-shot burn. The EDL must
@@ -46,6 +48,16 @@ const {
   DEFAULT_FADE_IN_S,
   DEFAULT_FADE_OUT_S,
 } = require('./rulebook');
+
+// ── Bundled fonts (Stage 12 TASK 2a) ─────────────────────
+// node:20-slim ships no fonts, so card text drawn via drawtext MUST point at
+// a bundled fontfile by absolute path (drawtext bypasses fontconfig this way).
+// DejaVu Sans (Bitstream Vera license — redistributable; see fonts/LICENSE.txt).
+const FONT_DIR = path.join(__dirname, 'fonts');
+const FONTS = {
+  bold:    path.join(FONT_DIR, 'DejaVuSans-Bold.ttf'),
+  regular: path.join(FONT_DIR, 'DejaVuSans.ttf'),
+};
 
 // ── Flag ──────────────────────────────────────────────────
 function isExecutorEnabled() {
@@ -120,9 +132,88 @@ function applyStyleOverrides(styleStr, overrides) {
   return Array.from(map.entries()).map(([k, val]) => `${k}=${val}`).join(',');
 }
 
+// Escape a filesystem path for use inside an ffmpeg filtergraph option
+// (forward slashes + escaped drive colon). On Linux there's no colon so it's
+// a near no-op; on Windows it turns C:\… into C\:/… as ffmpeg expects.
+function ffEscapePath(p) {
+  return String(p).replace(/\\/g, '/').replace(/:/g, '\\:');
+}
+
 function ffSubtitlesPath(srtPath) {
   // ffmpeg subtitles filter needs forward slashes and an escaped drive colon.
-  return srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+  return ffEscapePath(srtPath);
+}
+
+// ── Card segments (Stage 12 TASK 2a) ──────────────────────
+// Full-screen text beats: a dark scrim + centered headline (+ optional sub)
+// shown during the card segment's [t_in,t_out] window. Text is written to
+// files and referenced via drawtext textfile= so arbitrary headline content
+// (apostrophes, colons, %) never has to be escaped into the filtergraph.
+
+// Greedy word-wrap to keep headlines/subs inside the frame.
+function wrapText(text, maxChars) {
+  const words = String(text == null ? '' : text).trim().split(/\s+/).filter(Boolean);
+  const lines = [];
+  let cur = '';
+  for (const w of words) {
+    if (!cur) cur = w;
+    else if ((cur + ' ' + w).length <= maxChars) cur += ' ' + w;
+    else { lines.push(cur); cur = w; }
+  }
+  if (cur) lines.push(cur);
+  return lines.join('\n');
+}
+
+// Extract card segments → write their text files → return render metadata.
+// Does the fs work so buildCardFilterChain can stay pure/unit-testable.
+function buildCardData(edl, folder) {
+  const cards = [];
+  const segs = (edl.segments || []).filter(
+    (s) => s && s.layer === 'card' && s.card && (s.card.headline || s.card.sub)
+      && Number(s.t_out) > Number(s.t_in)
+  );
+  if (segs.length === 0) return cards;
+  const dir = path.join(folder, 'cards');
+  fs.mkdirSync(dir, { recursive: true });
+  segs.forEach((s, i) => {
+    const hFile = path.join(dir, `card_${i}_h.txt`);
+    fs.writeFileSync(hFile, wrapText(s.card.headline || '', 18), 'utf8');
+    let sFile = null;
+    if (s.card.sub) {
+      sFile = path.join(dir, `card_${i}_s.txt`);
+      fs.writeFileSync(sFile, wrapText(s.card.sub, 28), 'utf8');
+    }
+    cards.push({
+      t_in: Number(s.t_in), t_out: Number(s.t_out),
+      headlineFile: hFile, subFile: sFile, headlineSize: 78, subSize: 44,
+    });
+  });
+  return cards;
+}
+
+// Pure: build the comma-joined drawbox+drawtext chain for all card segments.
+// Returns '' when there are no cards (caller then skips the card stage).
+function buildCardFilterChain(cards, fonts) {
+  if (!Array.isArray(cards) || cards.length === 0) return '';
+  const f = fonts || FONTS;
+  const ops = [];
+  for (const c of cards) {
+    const en = `between(t,${c.t_in},${c.t_out})`;
+    ops.push(`drawbox=x=0:y=0:w=iw:h=ih:color=black@0.82:t=fill:enable='${en}'`);
+    ops.push(
+      `drawtext=fontfile='${ffEscapePath(f.bold)}':textfile='${ffEscapePath(c.headlineFile)}':` +
+      `fontcolor=white:fontsize=${c.headlineSize}:line_spacing=18:expansion=none:` +
+      `x=(w-text_w)/2:y=(h-text_h)/2-${c.subFile ? 70 : 0}:enable='${en}'`
+    );
+    if (c.subFile) {
+      ops.push(
+        `drawtext=fontfile='${ffEscapePath(f.regular)}':textfile='${ffEscapePath(c.subFile)}':` +
+        `fontcolor=0xDDDDDD:fontsize=${c.subSize}:line_spacing=12:expansion=none:` +
+        `x=(w-text_w)/2:y=(h/2)+90:enable='${en}'`
+      );
+    }
+  }
+  return ops.join(',');
 }
 
 // ── Asset resolution (Stage 12.4) ─────────────────────────
@@ -266,7 +357,7 @@ function dbToLinear(db) {
 //   [0]=avatar, [1..B]=broll, then music (if any), then one input per sfx.
 //   broll: [{ t_in, t_out }]   music: { duration_s } | null
 //   sfx:   [{ atS }]           edlMusic: edl.music | null
-function buildCompositeGraph({ subFilter, broll, music, edlMusic, sfx }) {
+function buildCompositeGraph({ subFilter, broll, music, edlMusic, sfx, cards, fonts }) {
   const parts = [];
   const sfxList = Array.isArray(sfx) ? sfx : [];
 
@@ -285,6 +376,15 @@ function buildCompositeGraph({ subFilter, broll, music, edlMusic, sfx }) {
     );
     last = `ov${k}`;
   });
+
+  // CARDS — full-screen text beats over the current video during their windows,
+  // burned BEFORE captions so captions still sit on top.
+  const cardChain = buildCardFilterChain(cards || [], fonts || FONTS);
+  if (cardChain) {
+    parts.push(`[${last}]${cardChain}[cards]`);
+    last = 'cards';
+  }
+
   parts.push(`[${last}]${subFilter}[v]`);
 
   // AUDIO — voiceover is always input [0]; layer a ducked/faded music bed
@@ -347,32 +447,40 @@ async function composeFromEdl({ edl, videoPath, srtPath, folder, captionStyle })
   const styleStr = applyStyleOverrides(captionStyle.style, {
     Alignment: placed.alignment,
     MarginV:   placed.marginV,
+    // node:20-slim ships no Arial/Impact — force the bundled DejaVu face so
+    // libass resolves it via fontsdir below instead of falling back to notdef.
+    FontName:  'DejaVu Sans',
   });
-  const subFilter = `subtitles='${ffSubtitlesPath(srtPath)}':force_style='${styleStr}'`;
+  const subFilter =
+    `subtitles='${ffSubtitlesPath(srtPath)}':fontsdir='${ffEscapePath(FONT_DIR)}':` +
+    `force_style='${styleStr}'`;
 
   const { music, broll, sfx } = await resolveAssets(edl, folder);
+  const cards = buildCardData(edl, folder);
   const outputPath = path.join(folder, 'final_video.mp4');
   const hasBroll = broll.length > 0;
   const hasMusic = !!(music && music.path && fs.existsSync(music.path));
   const sfxClips = (sfx || []).filter((s) => s && s.path && fs.existsSync(s.path));
   const hasSfx = sfxClips.length > 0;
+  const hasCards = cards.length > 0;
 
   console.log(
     `  [edit-brain] executor render — platform=${placed.platform} ` +
     `captions=${placed.position}(an${placed.alignment},mv${placed.marginV}) ` +
     `music=${hasMusic ? 'yes' : 'none'} broll=${broll.length} sfx=${sfxClips.length} ` +
-    `segments=${edl.segments.length}`
+    `cards=${cards.length} segments=${edl.segments.length}`
   );
 
   await new Promise((resolve, reject) => {
     const cmd = ffmpeg(videoPath);
 
-    if (!hasBroll && !hasMusic && !hasSfx) {
+    if (!hasBroll && !hasMusic && !hasSfx && !hasCards) {
       // Simplest path — avatar video + safe-zone captions only.
       cmd.videoFilters(subFilter);
     } else {
       // Inputs in a FIXED order so the filter labels line up:
       //   [0]=avatar, [1..B]=b-roll, then music (if any), then each sfx.
+      // Cards add NO inputs — they're drawbox/drawtext on the video chain.
       broll.forEach((b) => cmd.input(b.path));
       if (hasMusic) cmd.input(music.path);
       sfxClips.forEach((s) => cmd.input(s.path));
@@ -383,6 +491,8 @@ async function composeFromEdl({ edl, videoPath, srtPath, folder, captionStyle })
         music: hasMusic ? music : null,
         edlMusic: edl.music || null,
         sfx: sfxClips,
+        cards,
+        fonts: FONTS,
       });
       cmd.complexFilter(parts);
       cmd.outputOptions(mapOpts);
@@ -411,4 +521,8 @@ module.exports = {
   captionPlacement,
   applyStyleOverrides,
   resolveAssets,
+  buildCardFilterChain,
+  buildCardData,
+  wrapText,
+  FONTS,
 };

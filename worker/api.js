@@ -88,6 +88,26 @@ async function updatePieceStatus(id, status) {
   await call('POST', `/api/internal/pieces/${id}/status`, { status });
 }
 
+// Write the finished media back to the piece so the dashboard can preview
+// it (video_url / thumbnail_url / caption / captions_srt / duration_seconds).
+// Without this the R2 URL only lived in the local pipeline.json + the posts
+// table, so review-stage pieces had nothing playable. Best-effort caller:
+// pass only the fields the run produced.
+async function writePieceOutput(id, output) {
+  if (!id || !output || typeof output !== 'object') return;
+  await call('POST', `/api/internal/pieces/${id}/output`, output);
+}
+
+// Write the ordered media items for a NON-VIDEO piece (carousel slides /
+// single image) into content_media so the dashboard can render them. The
+// reel path uses writePieceOutput (single video_url); the image path uses
+// this (N rows, replace-all server-side). Each item:
+// { kind:'image'|'video', r2_key, position?, duration_s?, meta? }.
+async function writePieceMedia(id, media) {
+  if (!id || !Array.isArray(media) || media.length === 0) return;
+  await call('POST', `/api/internal/pieces/${id}/media`, { media });
+}
+
 // ── Posts ─────────────────────────────────────────────────
 async function insertPosts(rows) {
   const { written } = await call('POST', '/api/internal/posts', { rows });
@@ -140,6 +160,8 @@ module.exports = {
   getBrandConfig,
   insertIdeas,
   updatePieceStatus,
+  writePieceOutput,
+  writePieceMedia,
   insertPosts,
   resolveAssets,
   recordTrendingSounds,

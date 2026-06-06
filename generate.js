@@ -26,6 +26,12 @@ const { isExecutorEnabled, loadEdl, isValidEdl, composeFromEdl } = require('./ed
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
+// node:20-slim ships no fonts. libass caption styles below name Arial/Impact,
+// which don't exist in-container → notdef/blank text. Point libass at the
+// bundled DejaVu face (edit-brain/fonts/) via fontsdir + a FontName override.
+const CAPTION_FONT_DIR = path.join(__dirname, 'edit-brain', 'fonts');
+const ffEscapePath = (p) => String(p).replace(/\\/g, '/').replace(/:/g, '\\:');
+
 // ─── Optional --brand <uuid> ──────────────────────────────
 // When passed, voice/avatar/caption/audience config for that brand
 // is loaded from Supabase and overrides the .env defaults. Without
@@ -355,7 +361,18 @@ async function generateAvatarVideo(spokenText) {
 
     if (status === 'failed') {
       console.log('');
-      throw new Error(`HeyGen render failed: ${statusData.data?.error || 'unknown error'}`);
+      // HeyGen returns data.error as an object ({ code, message, detail }) —
+      // a bare template literal renders it "[object Object]". Surface the
+      // real reason so credit/avatar failures are diagnosable from the log.
+      const e = statusData.data?.error;
+      const detail = e == null
+        ? 'unknown error'
+        : typeof e === 'string'
+          ? e
+          : (e.message || e.detail || e.msg)
+            ? `${e.message || e.detail || e.msg}${e.code ? ` (code ${e.code})` : ''}`
+            : JSON.stringify(e);
+      throw new Error(`HeyGen render failed: ${detail}`);
     }
   }
 
@@ -462,7 +479,10 @@ async function burnCaptions(videoPath, srtPath, folder) {
 
   const outputPath = path.join(folder, 'final_video.mp4');
   const safeSrtPath = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
-  const filter = `subtitles='${safeSrtPath}':force_style='${captionStyle.style}'`;
+  const portableStyle = captionStyle.style.replace(/FontName=[^,]*/i, 'FontName=DejaVu Sans');
+  const filter =
+    `subtitles='${safeSrtPath}':fontsdir='${ffEscapePath(CAPTION_FONT_DIR)}':` +
+    `force_style='${portableStyle}'`;
 
   return new Promise((resolve, reject) => {
     ffmpeg(videoPath)
@@ -714,6 +734,23 @@ async function run() {
       } catch (r2Err) {
         log('error', `R2 upload failed: ${r2Err.message}`);
         pipelineState.steps.r2 = { status: 'failed', reason: r2Err.message };
+      }
+
+      // Write the finished media back to the piece so the dashboard can
+      // preview it (previously the R2 URL only lived in pipeline.json + the
+      // posts table → review-stage pieces had nothing playable). Emitted as a
+      // stdout marker the worker handler parses + brokers via the runner
+      // token. Runs regardless of POST_APPROVAL so the caption/video land now.
+      if (r2Url) {
+        try {
+          const capM = script.match(/─── POST CAPTION ───\n([\s\S]*?)─── HASHTAGS/);
+          const srtFile = path.join(folder, 'captions.srt');
+          const output = { video_url: r2Url, caption: capM ? capM[1].trim() : topic };
+          if (fs.existsSync(srtFile)) output.captions_srt = fs.readFileSync(srtFile, 'utf8');
+          console.log(`[[PIECE_OUTPUT]]${JSON.stringify(output)}`);
+        } catch (e) {
+          console.error(`    [generate] could not emit piece output: ${e.message}`);
+        }
       }
 
       if (!r2Url) {

@@ -17,6 +17,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const fs        = require('fs');
 const path      = require('path');
 const { recordUsage, anthropicCostUsd } = require('./worker/usage');
+const { isShotMiningEnabled, mineTopPosts } = require('./edit-brain/shot-mining');
 
 const APIFY_BASE = 'https://api.apify.com/v2';
 const PRINT_MODE = process.argv.includes('--print');
@@ -145,7 +146,9 @@ async function scrapeTikTok() {
       profiles:      config.tiktokAccounts,
       resultsPerPage: Math.ceil(config.postsLimit / Math.max(searches.length, 1)),
       maxProfilesPerQuery: 1,
-      shouldDownloadVideos: false,
+      // Only ask Apify to download videos when shot-level mining is on — it's
+      // an extra Apify + bandwidth cost (Stage 12 TASK 2b), off by default.
+      shouldDownloadVideos: isShotMiningEnabled(),
       shouldDownloadCovers: false,
     });
 
@@ -163,6 +166,9 @@ async function scrapeTikTok() {
         url:         item.webVideoUrl     || item.url || '',
         // Runtime in seconds (Edit Brain miner) — clockworks exposes videoMeta.duration.
         durationS:   item.videoMeta?.duration ?? null,
+        // Downloadable video URL for shot-level mining (Stage 12 TASK 2b) —
+        // present when shouldDownloadVideos is on. null otherwise.
+        videoDownloadUrl: item.mediaUrls?.[0] || item.videoMeta?.downloadAddr || null,
         // Trending-sound metadata (Edit Brain). Apify clockworks/tiktok-scraper
         // returns musicMeta; field names vary, so read defensively.
         musicId:     item.musicMeta?.musicId     || item.musicMeta?.id         || null,
@@ -207,6 +213,8 @@ async function scrapeInstagram() {
         url:         item.url             || item.shortCode ? `https://instagram.com/p/${item.shortCode}` : '',
         // Runtime in seconds (Edit Brain miner) — IG scraper exposes videoDuration on reels.
         durationS:   item.videoDuration ?? null,
+        // Downloadable reel URL for shot-level mining (Stage 12 TASK 2b).
+        videoDownloadUrl: item.videoUrl ?? null,
         // Trending-sound metadata (Edit Brain). apify/instagram-scraper exposes
         // musicInfo on reels; absent on photos — null is fine.
         musicId:     item.musicInfo?.audio_id    || null,
@@ -272,6 +280,7 @@ For each idea consider:
 - What core emotion or insight made the original post perform well
 - How to adapt the angle for this creator's specific niche and audience
 - The hook format that would work (curiosity, pain point, controversy, story, list)
+- The best CONTENT TYPE to deliver it: "reel" (short vertical video — default, best for narrative/emotional hooks), "carousel" (multi-slide images for step-by-step / listicles), "image" (one strong visual or quote), "story" (casual ephemeral), or "text" (discussion/text post)
 
 Respond ONLY with valid JSON — no text before or after. Use this exact format:
 {
@@ -284,6 +293,7 @@ Respond ONLY with valid JSON — no text before or after. Use this exact format:
       "hook": "The opening line for this video",
       "hookAlternative": "A second hook option",
       "whyItWillWork": "One sentence on why this resonates with the audience",
+      "contentType": "reel | story | carousel | image | text",
       "format": "reel | carousel | quote_card",
       "emotion": "curiosity | inspiration | controversy | relatability | fear_of_missing_out",
       "sourceInsight": "What from the scraped posts inspired this"
@@ -357,6 +367,14 @@ function saveTrends(topics, allPosts) {
 //  SUPABASE WRITE — insert content_ideas rows for a brand
 //  Called only when --brand <uuid> was passed.
 // ─────────────────────────────────────────────────────────
+// Normalize the model's contentType to the content_ideas CHECK set
+// (13_1_content_types). Anything unexpected → 'reel' (the safe default).
+const VALID_CONTENT_TYPES = new Set(['reel', 'story', 'carousel', 'image', 'text']);
+function normContentType(v) {
+  const t = String(v ?? '').trim().toLowerCase();
+  return VALID_CONTENT_TYPES.has(t) ? t : 'reel';
+}
+
 async function insertContentIdeas(brandId, topics, allPosts) {
   const { insertIdeas } = require('./worker/api');
 
@@ -385,6 +403,7 @@ async function insertContentIdeas(brandId, topics, allPosts) {
       why_it_will_work:  t.whyItWillWork ? String(t.whyItWillWork).slice(0, 1000) : null,
       emotion:           t.emotion ?? null,
       format:            t.format ?? null,
+      content_type:      normContentType(t.contentType),
       platform:          sourcePost?.platform ?? matchedPlatform ?? null,
       source:            sourcePost?.platform ?? null,
       source_url:        sourcePost?.url ?? null,
@@ -551,15 +570,21 @@ async function run() {
     allPosts.sort((a, b) => engagementScore(b) - engagementScore(a));
 
     // Mine editing patterns for the Edit Brain learning loop (fire-and-forget).
-    // v1 is METADATA ONLY — runtime + engagement + sound, no shot-level video
-    // analysis (that needs downloading videos; deferred for cost). The Director
-    // reads these back to bias target_duration_s + the edit. Dedupes on url.
+    // Always captures metadata (runtime + engagement + sound). When
+    // EDIT_BRAIN_SHOT_MINING is on (TASK 2b), ALSO downloads the top-N posts
+    // and runs ffmpeg scene detection for real avg_shot_len_s + shot_count.
+    // The Director reads these back to bias target_duration_s + pacing.
+    // Dedupes on url.
     try {
       const { recordEditingPatterns } = require('./worker/api');
+      // Shot-level enrichment (best-effort, no-op + empty Map when flag off).
+      const shotsByUrl = await mineTopPosts(allPosts, log);
       const patterns = allPosts
         .filter(p => p.url)
         .slice(0, 10)
-        .map(p => ({
+        .map(p => {
+          const shots = shotsByUrl.get(p.url) || null;
+          return {
           source_platform:     p.platform,
           source_post_url:     p.url,
           source_views:        p.views || 0,
@@ -569,8 +594,12 @@ async function run() {
             music_id:      p.musicId ? String(p.musicId) : null,
             caption_len:   p.description ? p.description.length : null,
             hashtag_count: (p.description.match(/#/g) || []).length,
+            // null unless shot-level mining ran for this post.
+            avg_shot_len_s: shots ? shots.avg_shot_len_s : null,
+            shot_count:     shots ? shots.shot_count : null,
           },
-        }));
+        };
+        });
       if (patterns.length) {
         const r = await recordEditingPatterns(patterns);
         if (r && r.ok) log('done', `Recorded ${r.recorded ?? patterns.length} editing pattern(s)`);

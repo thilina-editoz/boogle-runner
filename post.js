@@ -9,7 +9,7 @@
 //  Architecture:
 //    generate.js
 //      → uploadToR2(final_video.mp4) → publicUrl
-//      → postContent({ r2Url, caption, hashtags, folder })
+//      → postContent({ r2Url|mediaUrls, mediaType, caption, hashtags, folder })
 //          → POST {DASHBOARD}/api/internal/publish
 //              → adapter.publish() (UploadPostAdapter, etc.)
 // ─────────────────────────────────────────────────────────
@@ -133,11 +133,20 @@ async function pollPublishStatus({ requestId, platforms, base }) {
   return latest;
 }
 
-async function postContent({ r2Url, caption, hashtags, folder, brandId, contentPieceId }) {
+async function postContent({ r2Url, mediaUrls, mediaType, caption, hashtags, folder, brandId, contentPieceId }) {
   validateEnv();
 
-  if (!r2Url || typeof r2Url !== 'string') {
-    throw new Error('postContent requires r2Url (string)');
+  // Media kind selects the dashboard/Upload-Post endpoint:
+  //   video → one video URL (back-compat: callers pass r2Url)
+  //   photo → N image URLs (carousel slides, in order)
+  //   text  → no media
+  const kind = mediaType || 'video';
+  const urls = Array.isArray(mediaUrls) && mediaUrls.length > 0
+    ? mediaUrls
+    : (r2Url ? [r2Url] : []);
+
+  if (kind !== 'text' && urls.length === 0) {
+    throw new Error(`postContent requires at least one media URL for a ${kind} post`);
   }
 
   const platforms = parsePlatforms();
@@ -157,7 +166,8 @@ async function postContent({ r2Url, caption, hashtags, folder, brandId, contentP
     post_input: {
       platforms,
       text,
-      media_urls: [r2Url],
+      media_type: kind,
+      media_urls: urls,
       ...(scheduledFor ? { scheduled_for: scheduledFor } : {}),
     },
   };
