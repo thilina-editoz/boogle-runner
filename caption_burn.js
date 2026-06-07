@@ -11,7 +11,7 @@
 // ─────────────────────────────────────────────────────────
 
 const ffmpeg = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static');
+const ffmpegPath = require('./ffmpeg-bin').resolveFfmpegPath();
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');

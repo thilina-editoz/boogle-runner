@@ -435,25 +435,34 @@ function buildCompositeGraph({ subFilter, broll, music, edlMusic, sfx, cards, fo
 // Compose the final video from the EDL. Returns the output path.
 // Throws on any failure — the caller (generate.js) catches and falls
 // back to the legacy burnCaptions path.
-async function composeFromEdl({ edl, videoPath, srtPath, folder, captionStyle }) {
+async function composeFromEdl({ edl, videoPath, srtPath, assPath, folder, captionStyle }) {
   if (!videoPath || !fs.existsSync(videoPath)) {
     throw new Error('composeFromEdl: avatar video missing');
   }
-  if (!srtPath || !fs.existsSync(srtPath)) {
-    throw new Error('composeFromEdl: captions SRT missing');
+  const styledAss = assPath && fs.existsSync(assPath);
+  if (!styledAss && (!srtPath || !fs.existsSync(srtPath))) {
+    throw new Error('composeFromEdl: captions missing (no ASS and no SRT)');
   }
 
-  const placed   = captionPlacement(edl);
-  const styleStr = applyStyleOverrides(captionStyle.style, {
-    Alignment: placed.alignment,
-    MarginV:   placed.marginV,
-    // node:20-slim ships no Arial/Impact — force the bundled DejaVu face so
-    // libass resolves it via fontsdir below instead of falling back to notdef.
-    FontName:  'DejaVu Sans',
-  });
-  const subFilter =
-    `subtitles='${ffSubtitlesPath(srtPath)}':fontsdir='${ffEscapePath(FONT_DIR)}':` +
-    `force_style='${styleStr}'`;
+  // Styled ASS (word-by-word / karaoke / highlighted / …) carries its own
+  // styles + placement, so we render it directly. Otherwise fall back to the
+  // legacy SRT with safe-zone-aware libass force_style overrides.
+  const placed = captionPlacement(edl);
+  let subFilter;
+  if (styledAss) {
+    subFilter = `subtitles='${ffSubtitlesPath(assPath)}':fontsdir='${ffEscapePath(FONT_DIR)}'`;
+  } else {
+    const styleStr = applyStyleOverrides(captionStyle.style, {
+      Alignment: placed.alignment,
+      MarginV:   placed.marginV,
+      // node:20-slim ships no Arial/Impact — force the bundled DejaVu face so
+      // libass resolves it via fontsdir below instead of falling back to notdef.
+      FontName:  'DejaVu Sans',
+    });
+    subFilter =
+      `subtitles='${ffSubtitlesPath(srtPath)}':fontsdir='${ffEscapePath(FONT_DIR)}':` +
+      `force_style='${styleStr}'`;
+  }
 
   const { music, broll, sfx } = await resolveAssets(edl, folder);
   const cards = buildCardData(edl, folder);

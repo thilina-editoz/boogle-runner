@@ -18,7 +18,7 @@ const os = require('os');
 const path = require('path');
 const { execFile } = require('child_process');
 const { Readable } = require('stream');
-const ffmpegPath = require('ffmpeg-static');
+const ffmpegPath = require('../ffmpeg-bin').resolveFfmpegPath();
 
 function isShotMiningEnabled() {
   const v = String(process.env.EDIT_BRAIN_SHOT_MINING || '').trim().toLowerCase();

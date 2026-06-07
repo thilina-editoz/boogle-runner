@@ -91,6 +91,25 @@ async function loadBrandConfig(brandId) {
     voiceId:          voice?.voice_id ?? null,
     voiceModel:       voice?.voice_model ?? null,
     captionStyle:     caption?.style_id ?? null,
+    // Advanced ASS caption styling (14_1). captionStyleId selects the engine
+    // style; captionStyleOpts carries the per-style controls. Null → legacy.
+    captionStyleId:   caption?.caption_style ?? null,
+    captionStyleOpts: caption ? {
+      fontName:        caption.font_family ?? undefined,
+      fontSize:        caption.font_size ?? undefined,
+      position:        caption.position ?? undefined,
+      align:           caption.align ?? undefined,
+      marginV:         caption.margin_v ?? undefined,
+      primaryColour:   caption.primary_color ?? undefined,
+      highlightColour: caption.highlight_color ?? undefined,
+      outlineColour:   caption.outline_color ?? undefined,
+      outline:         caption.outline_width ?? undefined,
+      bold:            caption.bold ?? undefined,
+      uppercase:       caption.uppercase ?? undefined,
+      wordsPerCue:     caption.words_per_cue ?? undefined,
+      motion:          caption.motion ?? undefined,
+      vertical:        caption.vertical ?? undefined,
+    } : null,
     // Hashtags currently have no UI / table — caller falls back to .env
     // for those. Will move them to DB once we have a "monitored sources"
     // settings page.

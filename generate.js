@@ -15,7 +15,7 @@
 require('dotenv').config();
 const Anthropic  = require('@anthropic-ai/sdk');
 const ffmpeg     = require('fluent-ffmpeg');
-const ffmpegPath = require('ffmpeg-static');
+const ffmpegPath = require('./ffmpeg-bin').resolveFfmpegPath();
 const fs         = require('fs');
 const path       = require('path');
 const https      = require('https');
@@ -23,6 +23,7 @@ const { postContent } = require('./post');
 const { uploadToR2 } = require('./r2-upload');
 const { loadBrandConfig, withFallbacks } = require('./worker/brand-config');
 const { isExecutorEnabled, loadEdl, isValidEdl, composeFromEdl } = require('./edit-brain/executor');
+const { buildAss, STYLE_IDS } = require('./caption-styles');
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 
@@ -155,6 +156,39 @@ let config = {
 const cliStyleNum = parseInt(POSITIONAL[1]);
 let styleNum      = Number.isFinite(cliStyleNum) ? cliStyleNum : (config.captionStyle || 1);
 let captionStyle  = CAPTION_STYLES[styleNum] || CAPTION_STYLES[1];
+
+// Advanced ASS caption style (word_by_word / phrase / highlighted / karaoke /
+// minimalist). When set AND word-level timings exist (AssemblyAI), captions
+// render as styled ASS instead of the legacy SRT + force_style. Driven by env
+// today; the dashboard caption_config will set these per piece. null = legacy
+// behaviour, unchanged. CAPTION_STYLE_OPTS is an optional JSON blob of overrides
+// (fontSize, alignment, marginV, primaryColour, highlightColour, uppercase, …).
+function resolveCaptionStyleId(v) {
+  const s = String(v || '').trim().toLowerCase();
+  return STYLE_IDS.includes(s) ? s : null;
+}
+let captionStyleId = resolveCaptionStyleId(process.env.CAPTION_STYLE_ID);
+let captionStyleOpts = {};
+try {
+  if (process.env.CAPTION_STYLE_OPTS) captionStyleOpts = JSON.parse(process.env.CAPTION_STYLE_OPTS) || {};
+} catch (_e) { captionStyleOpts = {}; }
+
+// Build the styled ASS from word timings, when a style is selected. Returns the
+// .ass path or null (caller falls back to the legacy SRT burn).
+function maybeWriteStyledAss(words, folder) {
+  if (!captionStyleId || !words || !words.length) return null;
+  try {
+    const ass = buildAss(words, { ...captionStyleOpts, style: captionStyleId });
+    if (!ass) return null;
+    const p = path.join(folder, 'captions.ass');
+    fs.writeFileSync(p, ass, 'utf8');
+    log('done', `Styled captions (${captionStyleId}) → captions.ass`);
+    return p;
+  } catch (e) {
+    log('error', `Styled caption build failed (${e.message}) — using SRT`);
+    return null;
+  }
+}
 
 // ─────────────────────────────────────────────────────────
 //  STEP 1 — SCRIPT (Claude)
@@ -459,7 +493,10 @@ async function generateCaptions(audioFile, spokenText, folder) {
     const srtPath = path.join(folder, 'captions.srt');
     fs.writeFileSync(srtPath, srt);
     log('done', 'Frame-perfect captions saved → captions.srt');
-    return { status: 'real', file: srtPath };
+    // Styled captions need real word-level timings — build them here (null when
+    // no advanced style is selected → legacy SRT burn).
+    const assFile = maybeWriteStyledAss(transcript.words, folder);
+    return { status: 'real', file: srtPath, assFile };
 
   } else {
     log('step', 'Step 5/6 — Generating estimated captions from script...');
@@ -474,15 +511,25 @@ async function generateCaptions(audioFile, spokenText, folder) {
 // ─────────────────────────────────────────────────────────
 //  STEP 6 — BURN CAPTIONS INTO VIDEO
 // ─────────────────────────────────────────────────────────
-async function burnCaptions(videoPath, srtPath, folder) {
-  log('step', `Step 6/6 — Burning captions (Style ${styleNum}: ${captionStyle.name})...`);
+async function burnCaptions(videoPath, srtPath, folder, assPath) {
+  const styled = assPath && fs.existsSync(assPath);
+  log('step', styled
+    ? `Step 6/6 — Burning styled captions (${captionStyleId})...`
+    : `Step 6/6 — Burning captions (Style ${styleNum}: ${captionStyle.name})...`);
 
   const outputPath = path.join(folder, 'final_video.mp4');
-  const safeSrtPath = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
-  const portableStyle = captionStyle.style.replace(/FontName=[^,]*/i, 'FontName=DejaVu Sans');
-  const filter =
-    `subtitles='${safeSrtPath}':fontsdir='${ffEscapePath(CAPTION_FONT_DIR)}':` +
-    `force_style='${portableStyle}'`;
+  let filter;
+  if (styled) {
+    // ASS carries its own styles/animation — render it directly (no force_style).
+    const safeAss = assPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+    filter = `subtitles='${safeAss}':fontsdir='${ffEscapePath(CAPTION_FONT_DIR)}'`;
+  } else {
+    const safeSrtPath = srtPath.replace(/\\/g, '/').replace(/:/g, '\\:');
+    const portableStyle = captionStyle.style.replace(/FontName=[^,]*/i, 'FontName=DejaVu Sans');
+    filter =
+      `subtitles='${safeSrtPath}':fontsdir='${ffEscapePath(CAPTION_FONT_DIR)}':` +
+      `force_style='${portableStyle}'`;
+  }
 
   return new Promise((resolve, reject) => {
     ffmpeg(videoPath)
@@ -580,6 +627,13 @@ async function run() {
         styleNum     = brandCfg.captionStyle;
         captionStyle = CAPTION_STYLES[styleNum] || CAPTION_STYLES[1];
       }
+      // Advanced ASS caption style (14_1): the brand setting drives it unless
+      // an explicit env override is present (CAPTION_STYLE_ID wins for testing).
+      const brandStyleId = resolveCaptionStyleId(brandCfg.captionStyleId);
+      if (brandStyleId && !resolveCaptionStyleId(process.env.CAPTION_STYLE_ID)) {
+        captionStyleId = brandStyleId;
+        captionStyleOpts = { ...(brandCfg.captionStyleOpts || {}), ...captionStyleOpts };
+      }
       log('done', `Brand config loaded: ${brandCfg.brand_name ?? BRAND_ID}`);
     } catch (e) {
       log('error', `loadBrandConfig failed: ${e.message}`);
@@ -671,7 +725,7 @@ async function run() {
       // burn below, so a bad EDL can never regress a working render.
       if (isExecutorEnabled() && isValidEdl(EDL)) {
         try {
-          await composeFromEdl({ edl: EDL, videoPath, srtPath: captions.file, folder, captionStyle });
+          await composeFromEdl({ edl: EDL, videoPath, srtPath: captions.file, assPath: captions.assFile, folder, captionStyle });
           pipelineState.steps.finalVideo = { status: 'done', file: 'final_video.mp4', via: 'edit-brain' };
           pipelineState.editBrain = { used: true, platform: EDL.platform, segments: EDL.segments.length };
           log('done', 'Edit Brain executor render → final_video.mp4');
@@ -686,7 +740,7 @@ async function run() {
 
       if (!rendered) {
         try {
-          const finalPath = await burnCaptions(videoPath, captions.file, folder);
+          const finalPath = await burnCaptions(videoPath, captions.file, folder, captions.assFile);
           pipelineState.steps.finalVideo = { status: 'done', file: 'final_video.mp4' };
         } catch (burnErr) {
           log('error', `Caption burn failed: ${burnErr.message}`);
