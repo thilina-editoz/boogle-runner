@@ -153,10 +153,25 @@ async function recordEditingPatterns(patterns) {
   }
 }
 
+// ── BYOK keys (entered once in the dashboard) ──────────────
+// Pull the customer's API keys so they don't have to paste each one
+// into the runner .env too. Best-effort: never throws — a transient
+// dashboard blip just leaves the runner on its local .env.
+async function fetchApiKeys() {
+  try {
+    const { keys } = await call('GET', '/api/internal/keys');
+    return keys && typeof keys === 'object' ? keys : {};
+  } catch (err) {
+    console.error('  [keys] fetch failed, using local .env:', err.message);
+    return {};
+  }
+}
+
 module.exports = {
   getNextJob,
   completeJob,
   failJob,
+  fetchApiKeys,
   getBrandConfig,
   insertIdeas,
   updatePieceStatus,

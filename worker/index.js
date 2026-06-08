@@ -22,6 +22,7 @@
 // ─────────────────────────────────────────────────────────
 
 const { claimNextJob, completeJob, failJob } = require('./claim');
+const { syncKeysIntoEnv }  = require('./keys');
 const { handleScrape }     = require('./handlers/scrape');
 const { handleGenerate }   = require('./handlers/generate');
 const { handlePause, handleCancel } = require('./handlers/pause');
@@ -67,6 +68,11 @@ async function processOne() {
   activeJobId = job.id;
   console.log(`\n  [${ts()}] ▶ ${job.type} job ${job.id} (brand=${job.brand_id}, target=${job.target_id ?? '—'})`);
 
+  // Refresh BYOK keys from the dashboard so this job runs on the
+  // customer's latest keys (entered once in Settings → Integrations).
+  // Best-effort — falls back to .env if the fetch fails.
+  await syncKeysIntoEnv().catch(() => {});
+
   const handler = HANDLERS[job.type];
   if (!handler) {
     await failJob(job.id, `No handler for job type: ${job.type}`);
@@ -93,6 +99,11 @@ async function processOne() {
 
 async function run() {
   console.log(`  [${ts()}] Boogle worker started. Polling every ${POLL_INTERVAL_MS / 1000}s.`);
+
+  // Pull BYOK keys from the dashboard up front so the first job has them
+  // even if the customer only entered keys in the web UI.
+  await syncKeysIntoEnv().catch(() => {});
+
   while (!shuttingDown) {
     try {
       const didWork = await processOne();
